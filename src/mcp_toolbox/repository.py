@@ -47,12 +47,14 @@ class ToolRepository:
         self._configs: dict[str, MCPServerConfig] = {s.name: s for s in mcp_servers}
         self._tools: dict[str, ToolInfo] = {}
         self._server_info: dict[str, ServerInfo] = {}
-        # Persistent sessions kept alive by background tasks
         self._sessions: dict[str, ClientSession] = {}
-        self._bg_tasks: list[asyncio.Task] = []
+        # One background task per server, keyed by server name.
+        self._bg_tasks: dict[str, asyncio.Task] = {}
+        self._closing: bool = False
 
     async def connect(self) -> None:
         """Connect to all configured MCP servers and populate the tool registry."""
+        logger.info("Connecting to %d MCP server(s): %s", len(self._configs), list(self._configs))
         ready_events: dict[str, asyncio.Event] = {
             name: asyncio.Event() for name in self._configs
         }
@@ -62,12 +64,30 @@ class ToolRepository:
                 self._run_server_loop(cfg, ready_events[cfg.name]),
                 name=f"mcp-{cfg.name}",
             )
-            self._bg_tasks.append(task)
+            self._bg_tasks[cfg.name] = task
 
-        # Wait for every server to be ready (or fail) with a per-server timeout.
         async with anyio.create_task_group() as tg:
             for cfg in self._configs.values():
                 tg.start_soon(_wait_ready, cfg.name, ready_events[cfg.name], 30.0)
+
+        for name in self._configs:
+            if name not in self._server_info:
+                logger.error(
+                    "MCP server '%s' did not respond within 30s — marking as FAILED", name
+                )
+                self._server_info[name] = ServerInfo(
+                    name=name,
+                    status=ServerStatus.FAILED,
+                    tool_count=0,
+                    error="Connection timed out after 30s",
+                )
+
+        connected = [n for n, i in self._server_info.items() if i.status == ServerStatus.CONNECTED]
+        failed = [n for n, i in self._server_info.items() if i.status == ServerStatus.FAILED]
+        logger.info(
+            "MCP connect complete: %d connected %s, %d failed %s",
+            len(connected), connected, len(failed), failed,
+        )
 
     async def list_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -103,10 +123,11 @@ class ToolRepository:
 
     async def close(self) -> None:
         """Cancel all background connection tasks."""
-        for task in self._bg_tasks:
+        self._closing = True
+        for task in self._bg_tasks.values():
             task.cancel()
         if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            await asyncio.gather(*self._bg_tasks.values(), return_exceptions=True)
         self._bg_tasks.clear()
         self._sessions.clear()
 
@@ -132,7 +153,7 @@ class ToolRepository:
                     )
                     ready_event.set()
                     logger.warning(f"Failed to connect to '{cfg.name}': {exc}")
-                    return  # Don't retry for initial connection failures
+                    return  # Don't retry initial connection failures
                 logger.warning(f"Lost connection to '{cfg.name}': {exc}, reconnecting in 5s")
                 await asyncio.sleep(5)
 
@@ -143,13 +164,23 @@ class ToolRepository:
             async with streamablehttp_client(cfg.url, headers=headers) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await self._init_session(session, cfg, ready_event)
-                    await asyncio.sleep(float("inf"))  # keep context alive
+                    try:
+                        await asyncio.sleep(float("inf"))
+                    finally:
+                        # Only evict if this is still our session — a reconnect may have
+                        # already replaced it while we were sleeping.
+                        if self._sessions.get(cfg.name) is session:
+                            self._sessions.pop(cfg.name, None)
 
         elif cfg.transport == "sse":
             async with sse_client(cfg.url, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await self._init_session(session, cfg, ready_event)
-                    await asyncio.sleep(float("inf"))
+                    try:
+                        await asyncio.sleep(float("inf"))
+                    finally:
+                        if self._sessions.get(cfg.name) is session:
+                            self._sessions.pop(cfg.name, None)
 
         elif cfg.transport == "stdio":
             params = StdioServerParameters(
@@ -158,7 +189,11 @@ class ToolRepository:
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await self._init_session(session, cfg, ready_event)
-                    await asyncio.sleep(float("inf"))
+                    try:
+                        await asyncio.sleep(float("inf"))
+                    finally:
+                        if self._sessions.get(cfg.name) is session:
+                            self._sessions.pop(cfg.name, None)
 
         else:
             raise ValueError(f"Unsupported transport: '{cfg.transport}'")
@@ -191,6 +226,9 @@ class ToolRepository:
     ) -> Any:
         session = self._sessions.get(cfg.name)
         if session is None:
+            logger.error(
+                "No active MCP session for server '%s' — server may have disconnected", cfg.name
+            )
             raise ConnectionError(f"No active session for server '{cfg.name}'")
         mcp_name = _strip_prefix(cfg, tool_name)
         try:
@@ -201,12 +239,30 @@ class ToolRepository:
                 "Tool call '%s' on server '%s' timed out after %.0fs",
                 mcp_name, cfg.name, cfg.tool_call_timeout,
             )
-            # Evict the session — it may be in a broken state after the cancelled call.
-            # Subsequent calls will get ConnectionError immediately while _run_server_loop reconnects.
+            # Evict the broken session and restart the background task so the
+            # server reconnects automatically. Subsequent calls will get a
+            # ConnectionError (surfaced as a ToolException) until reconnected.
             self._sessions.pop(cfg.name, None)
+            if not self._closing:
+                self._schedule_reconnect(cfg)
             raise asyncio.TimeoutError(
                 f"Tool call '{mcp_name}' on server '{cfg.name}' timed out after {cfg.tool_call_timeout:.0f}s"
             )
+
+    def _schedule_reconnect(self, cfg: MCPServerConfig) -> None:
+        """Cancel the stale background task and start a fresh reconnect loop."""
+        old_task = self._bg_tasks.pop(cfg.name, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        ready_event = asyncio.Event()
+        ready_event.set()  # Already initialised; skip connect() wait
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(
+            self._run_server_loop(cfg, ready_event),
+            name=f"mcp-{cfg.name}",
+        )
+        self._bg_tasks[cfg.name] = task
+        logger.info("Scheduled reconnect for server '%s'", cfg.name)
 
 
 async def _wait_ready(name: str, event: asyncio.Event, timeout: float) -> None:
