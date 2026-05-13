@@ -17,3 +17,4 @@ venv/
 htmlcov/
 .coverage
 .idea/
+examples/test_platform_security_tools.py
