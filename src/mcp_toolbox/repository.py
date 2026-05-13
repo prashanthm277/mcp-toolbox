@@ -1,15 +1,15 @@
 import asyncio
 import logging
+from abc import ABC, abstractmethod
 from typing import Any
 
 import anyio
-
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.client.sse import sse_client
 
-from .models import MCPServerConfig, ServerInfo, ServerStatus, ToolDefinition, ToolInfo
+from .models import MCPServerConfig, ServerInfo, ServerStatus, ToolInfo
 
 logger = logging.getLogger(__name__)
 
@@ -19,281 +19,219 @@ class ToolNotFoundError(KeyError):
         if isinstance(tool_names, str):
             tool_names = [tool_names]
         self.tool_names = tool_names
-        names_str = ", ".join(f"'{n}'" for n in tool_names)
-        super().__init__(f"Tools not found in repository: {names_str}")
+        super().__init__(f"Tools not found: {', '.join(repr(n) for n in tool_names)}")
 
 
-class ToolRepository:
-    """
-    Aggregates tools from multiple MCP servers into a unified registry.
+class ToolRepository(ABC):
+    @abstractmethod
+    async def connect(self) -> None: ...
 
-    Maintains a persistent MCP session per server so that tool call responses
-    (which many servers deliver via the SSE GET stream rather than the POST body)
-    are reliably received.
+    @abstractmethod
+    async def list_tools(self) -> list[ToolInfo]: ...
 
-    Usage:
-        repo = ToolRepository([
-            MCPServerConfig(name="ui", url="http://localhost:5020"),
-            MCPServerConfig(name="platform", url="http://localhost:5010"),
-        ])
-        await repo.connect()
+    @abstractmethod
+    async def execute_tool(self, tool_name: str, args: dict[str, Any], meta: dict[str, Any] | None = None) -> Any: ...
 
-        tools = await repo.list_all_tools()
-        status = await repo.get_mcp_status()
-        result = await repo.execute_tool("platform_createWebPage", {"name": "Home"})
-    """
+    @abstractmethod
+    async def close(self) -> None: ...
 
-    def __init__(self, mcp_servers: list[MCPServerConfig]) -> None:
-        self._configs: dict[str, MCPServerConfig] = {s.name: s for s in mcp_servers}
+
+class MCPServerToolRepository(ToolRepository):
+    """Manages a persistent MCP session for a single server."""
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        self._config = config
         self._tools: dict[str, ToolInfo] = {}
-        self._server_info: dict[str, ServerInfo] = {}
-        self._sessions: dict[str, ClientSession] = {}
-        # One background task per server, keyed by server name.
-        self._bg_tasks: dict[str, asyncio.Task] = {}
-        self._closing: bool = False
+        self._session: ClientSession | None = None
+        self._server_info: ServerInfo | None = None
+        self._server_task: asyncio.Task | None = None
+        self._is_closing: bool = False
+
+    @property
+    def server_info(self) -> ServerInfo | None:
+        return self._server_info
 
     async def connect(self) -> None:
-        """Connect to all configured MCP servers and populate the tool registry."""
-        logger.info("Connecting to %d MCP server(s): %s", len(self._configs), list(self._configs))
-        ready_events: dict[str, asyncio.Event] = {
-            name: asyncio.Event() for name in self._configs
-        }
-        loop = asyncio.get_running_loop()
-        for cfg in self._configs.values():
-            task = loop.create_task(
-                self._run_server_loop(cfg, ready_events[cfg.name]),
-                name=f"mcp-{cfg.name}",
-            )
-            self._bg_tasks[cfg.name] = task
-
-        async with anyio.create_task_group() as tg:
-            for cfg in self._configs.values():
-                tg.start_soon(_wait_ready, cfg.name, ready_events[cfg.name], 30.0)
-
-        for name in self._configs:
-            if name not in self._server_info:
-                logger.error(
-                    "MCP server '%s' did not respond within 30s — marking as FAILED", name
-                )
-                self._server_info[name] = ServerInfo(
-                    name=name,
-                    status=ServerStatus.FAILED,
-                    tool_count=0,
-                    error="Connection timed out after 30s",
-                )
-
-        connected = [n for n, i in self._server_info.items() if i.status == ServerStatus.CONNECTED]
-        failed = [n for n, i in self._server_info.items() if i.status == ServerStatus.FAILED]
-        logger.info(
-            "MCP connect complete: %d connected %s, %d failed %s",
-            len(connected), connected, len(failed), failed,
+        logger.info("Connecting to MCP server '%s'", self._config.name)
+        ready_event = asyncio.Event()
+        self._server_task = asyncio.get_running_loop().create_task(
+            self._run_server_loop(ready_event),
+            name=f"mcp-{self._config.name}",
         )
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_wait_for_ready, self._config.name, ready_event, 30.0)
+        if self._server_info is None:
+            self._server_info = ServerInfo(
+                name=self._config.name,
+                status=ServerStatus.FAILED,
+                tool_count=0,
+                error="Connection timed out after 30s",
+            )
 
-    async def list_all_tools(self) -> list[ToolInfo]:
+    async def list_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
 
-    async def get_mcp_status(self) -> dict[str, ServerInfo]:
-        return dict(self._server_info)
-
-    async def get_tool_definition(self, tool_names: list[str]) -> list[ToolDefinition]:
-        missing = [n for n in tool_names if n not in self._tools]
-        if missing:
-            raise ToolNotFoundError(missing)
-        return [
-            ToolDefinition(
-                name=self._tools[n].name,
-                server=self._tools[n].server,
-                description=self._tools[n].description,
-                input_schema=self._tools[n].input_schema,
-            )
-            for n in tool_names
-        ]
-
-    async def execute_tool(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        meta: dict[str, Any] | None = None,
-    ) -> Any:
-        info = self._tools.get(tool_name)
-        if not info:
+    async def execute_tool(self, tool_name: str, args: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
+        if tool_name not in self._tools:
             raise ToolNotFoundError(tool_name)
-        cfg = self._configs[info.server]
-        return await self._call_tool(cfg, tool_name, arguments, meta=meta)
+        if self._session is None:
+            raise ConnectionError(f"No active session for server '{self._config.name}'")
+        try:
+            with anyio.fail_after(self._config.tool_call_timeout):
+                return await self._session.call_tool(tool_name, args, meta=meta)
+        except TimeoutError:
+            logger.error("Tool '%s' timed out after %.0fs", tool_name, self._config.tool_call_timeout)
+            self._session = None
+            if not self._is_closing:
+                self._schedule_reconnect()
+            raise asyncio.TimeoutError(
+                f"Tool '{tool_name}' timed out after {self._config.tool_call_timeout:.0f}s"
+            )
 
     async def close(self) -> None:
-        """Cancel all background connection tasks."""
-        self._closing = True
-        for task in self._bg_tasks.values():
-            task.cancel()
-        if self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks.values(), return_exceptions=True)
-        self._bg_tasks.clear()
-        self._sessions.clear()
+        self._is_closing = True
+        if self._server_task:
+            self._server_task.cancel()
+            await asyncio.gather(self._server_task, return_exceptions=True)
+        self._server_task = None
+        self._session = None
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    async def _run_server_loop(self, cfg: MCPServerConfig, ready_event: asyncio.Event) -> None:
-        """Keep a persistent MCP session alive; reconnect on failure."""
+    async def _run_server_loop(self, ready_event: asyncio.Event) -> None:
         while True:
             try:
-                await self._run_server(cfg, ready_event)
+                await self._run_server(ready_event)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                self._sessions.pop(cfg.name, None)
+                self._session = None
                 if not ready_event.is_set():
-                    self._server_info[cfg.name] = ServerInfo(
-                        name=cfg.name,
-                        status=ServerStatus.FAILED,
-                        tool_count=0,
-                        error=str(exc),
+                    self._server_info = ServerInfo(
+                        name=self._config.name, status=ServerStatus.FAILED, tool_count=0, error=str(exc)
                     )
                     ready_event.set()
-                    logger.warning(f"Failed to connect to '{cfg.name}': {exc}")
-                    return  # Don't retry initial connection failures
-                logger.warning(f"Lost connection to '{cfg.name}': {exc}, reconnecting in 5s")
+                    logger.warning("Failed to connect to '%s': %s", self._config.name, exc)
+                    return
+                logger.warning("Lost connection to '%s': %s — reconnecting in 5s", self._config.name, exc)
                 await asyncio.sleep(5)
 
-    async def _run_server(self, cfg: MCPServerConfig, ready_event: asyncio.Event) -> None:
-        """Open a single persistent MCP session, list tools, then idle until cancelled."""
-        headers = cfg.headers or {}
-        if cfg.transport == "streamable_http":
-            async with streamablehttp_client(cfg.url, headers=headers) as (read, write, _):
+    async def _run_server(self, ready_event: asyncio.Event) -> None:
+        headers = self._config.headers or {}
+        if self._config.transport == "streamable_http":
+            async with streamablehttp_client(self._config.url, headers=headers) as (read, write, _):
                 async with ClientSession(read, write) as session:
-                    await self._init_session(session, cfg, ready_event)
+                    await self._init_session(session, ready_event)
                     try:
                         await asyncio.sleep(float("inf"))
                     finally:
-                        # Only evict if this is still our session — a reconnect may have
-                        # already replaced it while we were sleeping.
-                        if self._sessions.get(cfg.name) is session:
-                            self._sessions.pop(cfg.name, None)
-
-        elif cfg.transport == "sse":
-            async with sse_client(cfg.url, headers=headers) as (read, write):
+                        if self._session is session:
+                            self._session = None
+        elif self._config.transport == "sse":
+            async with sse_client(self._config.url, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
-                    await self._init_session(session, cfg, ready_event)
+                    await self._init_session(session, ready_event)
                     try:
                         await asyncio.sleep(float("inf"))
                     finally:
-                        if self._sessions.get(cfg.name) is session:
-                            self._sessions.pop(cfg.name, None)
-
-        elif cfg.transport == "stdio":
-            params = StdioServerParameters(
-                command=cfg.command, args=cfg.args, env=cfg.env or None
+                        if self._session is session:
+                            self._session = None
+        elif self._config.transport == "stdio":
+            server_params = StdioServerParameters(
+                command=self._config.command, args=self._config.args, env=self._config.env or None
             )
-            async with stdio_client(params) as (read, write):
+            async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
-                    await self._init_session(session, cfg, ready_event)
+                    await self._init_session(session, ready_event)
                     try:
                         await asyncio.sleep(float("inf"))
                     finally:
-                        if self._sessions.get(cfg.name) is session:
-                            self._sessions.pop(cfg.name, None)
-
+                        if self._session is session:
+                            self._session = None
         else:
-            raise ValueError(f"Unsupported transport: '{cfg.transport}'")
+            raise ValueError(f"Unsupported transport: '{self._config.transport}'")
 
-    async def _init_session(
-        self, session: ClientSession, cfg: MCPServerConfig, ready_event: asyncio.Event
-    ) -> None:
-        """Initialize the session, load tools, and mark the server as ready."""
+    async def _init_session(self, session: ClientSession, ready_event: asyncio.Event) -> None:
         await session.initialize()
-        response = await session.list_tools()
-        tools = _parse_tools(response.tools, cfg)
+        tools_response = await session.list_tools()
+        tools = [
+            ToolInfo(
+                name=tool.name,
+                server=self._config.name,
+                description=tool.description or "",
+                input_schema=_schema_to_dict(tool.inputSchema),
+            )
+            for tool in tools_response.tools
+        ]
         for tool in tools:
             self._tools[tool.name] = tool
-        self._sessions[cfg.name] = session
-        self._server_info[cfg.name] = ServerInfo(
-            name=cfg.name,
-            status=ServerStatus.CONNECTED,
-            tool_count=len(tools),
+        self._session = session
+        self._server_info = ServerInfo(
+            name=self._config.name, status=ServerStatus.CONNECTED, tool_count=len(tools)
         )
-        logger.info(f"Connected to '{cfg.name}': {len(tools)} tools loaded")
+        logger.info("Connected to '%s': %d tools loaded", self._config.name, len(tools))
         if not ready_event.is_set():
             ready_event.set()
 
-    async def _call_tool(
-        self,
-        cfg: MCPServerConfig,
-        tool_name: str,
-        arguments: dict[str, Any],
-        meta: dict[str, Any] | None = None,
-    ) -> Any:
-        session = self._sessions.get(cfg.name)
-        if session is None:
-            logger.error(
-                "No active MCP session for server '%s' — server may have disconnected", cfg.name
-            )
-            raise ConnectionError(f"No active session for server '{cfg.name}'")
-        mcp_name = _strip_prefix(cfg, tool_name)
-        try:
-            with anyio.fail_after(cfg.tool_call_timeout):
-                return await session.call_tool(mcp_name, arguments, meta=meta)
-        except TimeoutError:
-            logger.error(
-                "Tool call '%s' on server '%s' timed out after %.0fs",
-                mcp_name, cfg.name, cfg.tool_call_timeout,
-            )
-            # Evict the broken session and restart the background task so the
-            # server reconnects automatically. Subsequent calls will get a
-            # ConnectionError (surfaced as a ToolException) until reconnected.
-            self._sessions.pop(cfg.name, None)
-            if not self._closing:
-                self._schedule_reconnect(cfg)
-            raise asyncio.TimeoutError(
-                f"Tool call '{mcp_name}' on server '{cfg.name}' timed out after {cfg.tool_call_timeout:.0f}s"
-            )
-
-    def _schedule_reconnect(self, cfg: MCPServerConfig) -> None:
-        """Cancel the stale background task and start a fresh reconnect loop."""
-        old_task = self._bg_tasks.pop(cfg.name, None)
-        if old_task and not old_task.done():
-            old_task.cancel()
-        ready_event = asyncio.Event()
-        ready_event.set()  # Already initialised; skip connect() wait
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(
-            self._run_server_loop(cfg, ready_event),
-            name=f"mcp-{cfg.name}",
+    def _schedule_reconnect(self) -> None:
+        if self._server_task and not self._server_task.done():
+            self._server_task.cancel()
+        reconnect_event = asyncio.Event()
+        reconnect_event.set()
+        self._server_task = asyncio.get_running_loop().create_task(
+            self._run_server_loop(reconnect_event),
+            name=f"mcp-{self._config.name}",
         )
-        self._bg_tasks[cfg.name] = task
-        logger.info("Scheduled reconnect for server '%s'", cfg.name)
+        logger.info("Scheduled reconnect for server '%s'", self._config.name)
 
 
-async def _wait_ready(name: str, event: asyncio.Event, timeout: float) -> None:
-    """Wait for a server's ready event with a timeout."""
-    with anyio.move_on_after(timeout):
-        await event.wait()
+class CompositeToolRepository(ToolRepository):
+    """Aggregates multiple ToolRepository instances, prefixing tool names with the map key."""
+
+    def __init__(self, repos: dict[str, ToolRepository]) -> None:
+        self._repos = repos
+
+    async def connect(self) -> None:
+        async with anyio.create_task_group() as task_group:
+            for repo in self._repos.values():
+                task_group.start_soon(repo.connect)
+
+    async def list_tools(self) -> list[ToolInfo]:
+        all_tools = []
+        for server_prefix, repo in self._repos.items():
+            for tool in await repo.list_tools():
+                all_tools.append(ToolInfo(
+                    name=f"{server_prefix}_{tool.name}",
+                    server=tool.server,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                ))
+        return all_tools
+
+    async def execute_tool(self, tool_name: str, args: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
+        for server_prefix, repo in self._repos.items():
+            if tool_name.startswith(f"{server_prefix}_"):
+                raw_tool_name = tool_name[len(server_prefix) + 1:]
+                return await repo.execute_tool(raw_tool_name, args, meta=meta)
+        raise ToolNotFoundError(tool_name)
+
+    async def close(self) -> None:
+        async with anyio.create_task_group() as task_group:
+            for repo in self._repos.values():
+                task_group.start_soon(repo.close)
+
+    async def get_status(self) -> dict[str, ServerInfo]:
+        return {
+            server_prefix: repo.server_info
+            for server_prefix, repo in self._repos.items()
+            if isinstance(repo, MCPServerToolRepository) and repo.server_info
+        }
 
 
-def _parse_tools(raw_tools: list, cfg: MCPServerConfig) -> list[ToolInfo]:
-    prefix = f"{cfg.name}_" if cfg.tool_name_prefix else ""
-    return [
-        ToolInfo(
-            name=f"{prefix}{t.name}",
-            server=cfg.name,
-            description=t.description or "",
-            input_schema=_to_dict(t.inputSchema),
-        )
-        for t in raw_tools
-    ]
+async def _wait_for_ready(server_name: str, ready_event: asyncio.Event, timeout_seconds: float) -> None:
+    with anyio.move_on_after(timeout_seconds):
+        await ready_event.wait()
 
 
-def _strip_prefix(cfg: MCPServerConfig, tool_name: str) -> str:
-    """Return the raw MCP tool name by removing the server prefix added by _parse_tools."""
-    if cfg.tool_name_prefix:
-        prefix = f"{cfg.name}_"
-        if tool_name.startswith(prefix):
-            return tool_name[len(prefix):]
-    return tool_name
-
-
-def _to_dict(schema: Any) -> dict:
+def _schema_to_dict(schema: Any) -> dict:
     if not schema:
         return {}
     if isinstance(schema, dict):

@@ -1,82 +1,38 @@
+"""MetaToolRepository: wraps any ToolRepository and exposes it to LLM agents
+as exactly two tools — get_tool_definition and execute_tool.
+
+Works with any LLM SDK (Anthropic, OpenAI, Gemini, etc.).
+
+Example:
+    platform_repo = MCPServerToolRepository(MCPServerConfig(name="platform", url="..."))
+    composite     = CompositeToolRepository({"platform": platform_repo})
+    meta          = MetaToolRepository(composite)
+    await meta.connect()
+
+    # tools the LLM sees
+    tools = await meta.list_tools()
+    # → [ToolInfo(get_tool_definition), ToolInfo(execute_tool)]
+
+    # dispatch an LLM tool call
+    result = await meta.execute_tool(
+        "execute_tool",
+        {"tool_name": "platform_createPage", "tool_args": {"name": "Home"}},
+    )
 """
-LLM-callable meta-tools that expose get_tool_definition and execute_tool
-as JSON-schema tool definitions bound to a ToolRepository instance.
 
-Works with any LLM SDK that accepts tool definitions as dicts
-(Anthropic, OpenAI, Gemini, etc.).
+from typing import Any
 
-Example (Anthropic):
-    repo = ToolRepository([...])
-    await repo.connect()
+from .models import ToolInfo
+from .repository import ToolNotFoundError, ToolRepository
 
-    meta_tools = make_tools(repo, meta_provider=my_auth_fn)
-    # Pass meta_tools.definitions to the LLM as tools.
-    # When the LLM calls a tool, dispatch via meta_tools.dispatch(name, args).
-"""
-
-from typing import Any, Callable, Optional
-
-from .repository import ToolRepository
-
-
-def make_tools(
-    repo: ToolRepository,
-    meta_provider: Optional[Callable[[str], dict | None]] = None,
-) -> "MetaToolSet":
-    return MetaToolSet(repo, meta_provider=meta_provider)
-
-
-class MetaToolSet:
-    """Holds get_tool_definition and execute_tool bound to a ToolRepository.
-
-    The optional ``meta_provider`` callback is invoked with the tool_name before
-    each execute_tool call. Return a dict to forward as MCP ``meta=`` (e.g. auth
-    context), or ``None`` to skip.
-    """
-
-    def __init__(
-        self,
-        repo: ToolRepository,
-        meta_provider: Optional[Callable[[str], dict | None]] = None,
-    ) -> None:
-        self._repo = repo
-        self._meta_provider = meta_provider
-        self.definitions = [
-            _GET_TOOL_DEFINITION_SCHEMA,
-            _EXECUTE_TOOL_SCHEMA,
-        ]
-
-    async def dispatch(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        if tool_name == "get_tool_definition":
-            return await self._get_tool_definition(**arguments)
-        if tool_name == "execute_tool":
-            return await self._execute_tool(**arguments)
-        raise ValueError(f"Unknown meta-tool: '{tool_name}'")
-
-    async def _get_tool_definition(self, tool_names: list[str]) -> list[dict[str, Any]]:
-        defns = await self._repo.get_tool_definition(tool_names)
-        return [
-            {
-                "name": d.name,
-                "server": d.server,
-                "description": d.description,
-                "input_schema": d.input_schema,
-            }
-            for d in defns
-        ]
-
-    async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
-        meta = self._meta_provider(tool_name) if self._meta_provider else None
-        return await self._repo.execute_tool(tool_name, tool_args, meta=meta)
-
-
-_GET_TOOL_DEFINITION_SCHEMA = {
-    "name": "get_tool_definition",
-    "description": (
-        "Get the full definition (description + input schema) for one or more tools by name. "
-        "Use this before calling execute_tool to understand required arguments."
+_GET_TOOL_DEFINITION_INFO = ToolInfo(
+    name="get_tool_definition",
+    server="meta",
+    description=(
+        "Get the full definition (description + input schema) of one or more tools by name. "
+        "Use this before execute_tool to discover required arguments."
     ),
-    "input_schema": {
+    input_schema={
         "type": "object",
         "properties": {
             "tool_names": {
@@ -88,15 +44,16 @@ _GET_TOOL_DEFINITION_SCHEMA = {
         },
         "required": ["tool_names"],
     },
-}
+)
 
-_EXECUTE_TOOL_SCHEMA = {
-    "name": "execute_tool",
-    "description": (
-        "Execute a named tool from the MCP tool registry with the given arguments. "
+_EXECUTE_TOOL_INFO = ToolInfo(
+    name="execute_tool",
+    server="meta",
+    description=(
+        "Execute a named tool from the MCP tool registry. "
         "Use get_tool_definition first to discover the required argument schema."
     ),
-    "input_schema": {
+    input_schema={
         "type": "object",
         "properties": {
             "tool_name": {
@@ -108,6 +65,52 @@ _EXECUTE_TOOL_SCHEMA = {
                 "description": "Key-value arguments matching the tool's input schema.",
             },
         },
-        "required": ["tool_name", "tool_args"],
+        "required": ["tool_name"],
     },
-}
+)
+
+
+class MetaToolRepository(ToolRepository):
+    """Wraps any ToolRepository and exposes it to LLM agents as two meta-tools."""
+
+    def __init__(self, repo: ToolRepository) -> None:
+        self._repo = repo
+
+    async def connect(self) -> None:
+        await self._repo.connect()
+
+    async def list_tools(self) -> list[ToolInfo]:
+        return [_GET_TOOL_DEFINITION_INFO, _EXECUTE_TOOL_INFO]
+
+    async def execute_tool(self, tool_name: str, args: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
+        if tool_name == "get_tool_definition":
+            return await self._get_tool_definition(args)
+        if tool_name == "execute_tool":
+            return await self._execute_tool(args, meta)
+        raise ToolNotFoundError(tool_name)
+
+    async def close(self) -> None:
+        await self._repo.close()
+
+    async def _get_tool_definition(self, args: dict[str, Any]) -> list[dict[str, Any]]:
+        requested_tool_names = args.get("tool_names", [])
+        tool_registry = {tool.name: tool for tool in await self._repo.list_tools()}
+        missing_tools = [name for name in requested_tool_names if name not in tool_registry]
+        if missing_tools:
+            raise ToolNotFoundError(missing_tools)
+        return [
+            {
+                "name": tool_registry[name].name,
+                "server": tool_registry[name].server,
+                "description": tool_registry[name].description,
+                "input_schema": tool_registry[name].input_schema,
+            }
+            for name in requested_tool_names
+        ]
+
+    async def _execute_tool(self, args: dict[str, Any], meta: dict[str, Any] | None) -> Any:
+        tool_name = args.get("tool_name")
+        tool_args = args.get("tool_args") or {}
+        if not tool_name:
+            raise ValueError("execute_tool requires 'tool_name'")
+        return await self._repo.execute_tool(tool_name, tool_args, meta=meta)
