@@ -38,16 +38,16 @@ async def main() -> None:
         print(f"  [{tool.server}] {tool.name} — {tool.description[:60]}")
 
     # Wrap in MetaToolRepository — this is what you expose to the LLM
-    meta = MetaToolRepository(composite)
+    metaRepo = MetaToolRepository(composite)
 
-    llm_tools = await meta.list_tools()
+    llm_tools = await metaRepo.list_tools()
     print(f"\nTools exposed to LLM:")
     for t in llm_tools:
         print(f"  - {t.name}: {t.description[:60]}")
 
     # Simulate: LLM calls get_tool_definition
     if tools:
-        result = await meta.execute_tool(
+        result = await metaRepo.execute_tool(
             "get_tool_definition", {"tool_names": [tools[0].name]}
         )
         print(f"\nLLM called get_tool_definition → {result}")

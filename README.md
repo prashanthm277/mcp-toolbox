@@ -23,28 +23,28 @@ async def main():
     platform_repo = MCPServerToolRepository(
         MCPServerConfig(name="platform", url="http://localhost:5010/mcp", transport="streamable_http")
     )
-    composite = CompositeToolRepository({"platform": platform_repo})
-    meta      = MetaToolRepository(composite)
+    compositeRepo = CompositeToolRepository({"platform": platform_repo})
+    metaRepo  = MetaToolRepository(compositeRepo)
 
-    await meta.connect()
+    await metaRepo.connect()
 
     # Two tools the LLM sees
-    tools = await meta.list_tools()
+    tools = await metaRepo.list_tools()
     # → [ToolInfo(get_tool_definition), ToolInfo(execute_tool)]
 
     # LLM discovers a tool's schema
-    definitions = await meta.execute_tool(
+    definitions = await metaRepo.execute_tool(
         "get_tool_definition",
         {"tool_names": ["platform_createPage"]},
     )
 
     # LLM calls the tool
-    result = await meta.execute_tool(
+    result = await metaRepo.execute_tool(
         "execute_tool",
         {"tool_name": "platform_createPage", "tool_args": {"name": "Home"}},
     )
 
-    await meta.close()
+    await metaRepo.close()
 
 asyncio.run(main())
 ```
@@ -142,10 +142,9 @@ Pass a `meta` dict to `execute_tool` — it is forwarded as-is to the MCP server
 ```python
 request_context = {
     "auth_cookie": "...",
-    "projectId": "...",
 }
 
-await meta.execute_tool(
+await metaRepo.execute_tool(
     "execute_tool",
     {"tool_name": "platform_createPage", "tool_args": {"name": "Home"}},
     meta=request_context,

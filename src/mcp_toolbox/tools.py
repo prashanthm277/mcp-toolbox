@@ -73,11 +73,11 @@ _EXECUTE_TOOL_INFO = ToolInfo(
 class MetaToolRepository(ToolRepository):
     """Wraps any ToolRepository and exposes it to LLM agents as two meta-tools."""
 
-    def __init__(self, repo: ToolRepository) -> None:
-        self._repo = repo
+    def __init__(self, tool_repo: ToolRepository) -> None:
+        self._tool_repo = tool_repo
 
     async def connect(self) -> None:
-        await self._repo.connect()
+        await self._tool_repo.connect()
 
     async def list_tools(self) -> list[ToolInfo]:
         return [_GET_TOOL_DEFINITION_INFO, _EXECUTE_TOOL_INFO]
@@ -90,11 +90,11 @@ class MetaToolRepository(ToolRepository):
         raise ToolNotFoundError(tool_name)
 
     async def close(self) -> None:
-        await self._repo.close()
+        await self._tool_repo.close()
 
     async def _get_tool_definition(self, args: dict[str, Any]) -> list[dict[str, Any]]:
         requested_tool_names = args.get("tool_names", [])
-        tool_registry = {tool.name: tool for tool in await self._repo.list_tools()}
+        tool_registry = {tool.name: tool for tool in await self._tool_repo.list_tools()}
         missing_tools = [name for name in requested_tool_names if name not in tool_registry]
         if missing_tools:
             raise ToolNotFoundError(missing_tools)
@@ -113,4 +113,4 @@ class MetaToolRepository(ToolRepository):
         tool_args = args.get("tool_args") or {}
         if not tool_name:
             raise ValueError("execute_tool requires 'tool_name'")
-        return await self._repo.execute_tool(tool_name, tool_args, meta=meta)
+        return await self._tool_repo.execute_tool(tool_name, tool_args, meta=meta)
