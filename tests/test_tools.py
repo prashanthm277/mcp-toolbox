@@ -53,11 +53,21 @@ class TestMetaToolSet:
         meta = make_tools(repo)
 
         result = await meta.dispatch(
-            "execute_tool", {"tool_name": "ui__click", "arguments": {"selector": "#btn"}}
+            "execute_tool", {"tool_name": "ui__click", "tool_args": {"selector": "#btn"}}
         )
 
-        repo.execute_tool.assert_awaited_once_with("ui__click", {"selector": "#btn"})
+        repo.execute_tool.assert_awaited_once_with("ui__click", {"selector": "#btn"}, meta=None)
         assert result == {"status": "ok"}
+
+    async def test_dispatch_execute_tool_with_meta_provider(self):
+        repo = _make_repo(execute_result="done")
+        meta = make_tools(repo, meta_provider=lambda name: {"auth_cookie": "abc"})
+
+        await meta.dispatch("execute_tool", {"tool_name": "platform_doThing", "tool_args": {}})
+
+        repo.execute_tool.assert_awaited_once_with(
+            "platform_doThing", {}, meta={"auth_cookie": "abc"}
+        )
 
     async def test_dispatch_raises_for_unknown_meta_tool(self):
         meta = make_tools(MagicMock())

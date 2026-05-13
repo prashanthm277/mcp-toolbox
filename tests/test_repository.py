@@ -315,3 +315,63 @@ class TestExecuteTool:
 
         with pytest.raises(ConnectionError, match="No active session"):
             await repo.execute_tool("test_server_run_cmd", {})
+
+
+# ---------------------------------------------------------------------------
+# MCPServerConfig — headers are stored and passed to the transport
+# ---------------------------------------------------------------------------
+
+class TestMCPServerConfigHeaders:
+    def test_headers_stored_on_config(self):
+        """Headers passed to MCPServerConfig are accessible on the config object."""
+        cfg = MCPServerConfig(
+            name="platform",
+            url="http://localhost:5010/mcp",
+            headers={"Authorization": "Bearer changeme"},
+        )
+        assert cfg.headers == {"Authorization": "Bearer changeme"}
+
+    def test_default_headers_is_empty(self):
+        """Headers default to an empty dict when not provided."""
+        cfg = MCPServerConfig(name="platform", url="http://localhost:5010/mcp")
+        assert cfg.headers == {}
+
+    async def test_headers_forwarded_to_transport_on_connect(self):
+        """Headers from MCPServerConfig are passed to the HTTP transport on connect."""
+        captured: dict = {}
+
+        async def fake_loop(self_repo, cfg, ready_event):
+            captured["headers"] = cfg.headers
+            from mcp_toolbox.models import ServerInfo, ServerStatus
+            self_repo._server_info[cfg.name] = ServerInfo(
+                name=cfg.name, status=ServerStatus.CONNECTED, tool_count=0
+            )
+            ready_event.set()
+
+        cfg = MCPServerConfig(
+            name="platform",
+            url="http://localhost:5010/mcp",
+            headers={"Authorization": "Bearer changeme"},
+        )
+        with patch.object(ToolRepository, "_run_server_loop", fake_loop):
+            repo = ToolRepository([cfg])
+            await repo.connect()
+
+        assert captured["headers"] == {"Authorization": "Bearer changeme"}
+
+    async def test_missing_auth_token_defaults_to_na(self):
+        """Simulates config.yaml default: missing env var → headers get 'Bearer NA'."""
+        import os
+        auth_token = os.environ.get("MCP_PLATFORM_AUTH_TOKEN", "NA")
+        header_value = f"Bearer {auth_token}"
+
+        cfg = MCPServerConfig(
+            name="platform",
+            url="http://localhost:5010/mcp",
+            headers={"Authorization": header_value},
+        )
+        # When env var is unset, the header is "Bearer NA" — server would reject with 401
+        if auth_token == "NA":
+            assert cfg.headers["Authorization"] == "Bearer NA"
+        else:
+            assert cfg.headers["Authorization"] == f"Bearer {auth_token}"

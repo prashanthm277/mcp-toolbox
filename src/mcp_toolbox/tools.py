@@ -9,25 +9,38 @@ Example (Anthropic):
     repo = ToolRepository([...])
     await repo.connect()
 
-    meta_tools = make_tools(repo)
-    # Pass meta_tools[i]["definition"] to the LLM as a tool.
+    meta_tools = make_tools(repo, meta_provider=my_auth_fn)
+    # Pass meta_tools.definitions to the LLM as tools.
     # When the LLM calls a tool, dispatch via meta_tools.dispatch(name, args).
 """
 
-from typing import Any
+from typing import Any, Callable, Optional
 
 from .repository import ToolRepository
 
 
-def make_tools(repo: ToolRepository) -> "MetaToolSet":
-    return MetaToolSet(repo)
+def make_tools(
+    repo: ToolRepository,
+    meta_provider: Optional[Callable[[str], dict | None]] = None,
+) -> "MetaToolSet":
+    return MetaToolSet(repo, meta_provider=meta_provider)
 
 
 class MetaToolSet:
-    """Holds get_tool_definition and execute_tool bound to a ToolRepository."""
+    """Holds get_tool_definition and execute_tool bound to a ToolRepository.
 
-    def __init__(self, repo: ToolRepository) -> None:
+    The optional ``meta_provider`` callback is invoked with the tool_name before
+    each execute_tool call. Return a dict to forward as MCP ``meta=`` (e.g. auth
+    context), or ``None`` to skip.
+    """
+
+    def __init__(
+        self,
+        repo: ToolRepository,
+        meta_provider: Optional[Callable[[str], dict | None]] = None,
+    ) -> None:
         self._repo = repo
+        self._meta_provider = meta_provider
         self.definitions = [
             _GET_TOOL_DEFINITION_SCHEMA,
             _EXECUTE_TOOL_SCHEMA,
@@ -52,9 +65,9 @@ class MetaToolSet:
             for d in defns
         ]
 
-    async def _execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        result = await self._repo.execute_tool(tool_name, arguments)
-        return result
+    async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> Any:
+        meta = self._meta_provider(tool_name) if self._meta_provider else None
+        return await self._repo.execute_tool(tool_name, tool_args, meta=meta)
 
 
 _GET_TOOL_DEFINITION_SCHEMA = {
@@ -90,11 +103,11 @@ _EXECUTE_TOOL_SCHEMA = {
                 "type": "string",
                 "description": "The exact name of the tool to execute.",
             },
-            "arguments": {
+            "tool_args": {
                 "type": "object",
                 "description": "Key-value arguments matching the tool's input schema.",
             },
         },
-        "required": ["tool_name", "arguments"],
+        "required": ["tool_name", "tool_args"],
     },
 }
