@@ -67,7 +67,7 @@ def convert_to_langchain_tools(
     Args:
         tools: Tool definitions to convert (e.g. from MetaToolRepository.list_tools()).
         executor: Async callable — (tool_name, args, *, meta=None) -> Any.
-                  Typically MetaToolRepository.execute_tool.
+                  Typically, MetaToolRepository.execute_tool.
         meta_provider: Optional callback (tool_name, kwargs) -> dict | None that
             returns auth/meta context to forward on each call.
     """

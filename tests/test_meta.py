@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mcp_toolbox import ToolInfo, ToolNotFoundError
-from mcp_toolbox.tools import MetaToolRepository
+from mcp_toolbox.meta import MetaToolRepository
 
 
 def _make_inner_repo(tools: list[ToolInfo] | None = None, execute_result: object = None):

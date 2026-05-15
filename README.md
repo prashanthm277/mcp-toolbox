@@ -163,6 +163,79 @@ await metaRepo.execute_tool(
 
 If a tool call exceeds `tool_call_timeout`, the broken session is evicted and a background reconnect task starts automatically. Calls made during reconnection raise `ConnectionError`.
 
+## Optional: LangChain integration
+
+`mcp_toolbox.langchain_tools` converts any list of `ToolInfo` objects into
+LangChain `BaseTool` instances so you can pass them directly to a LangChain
+agent or `AgentExecutor`.
+
+### Install
+
+```bash
+pip install mcp-toolbox[langchain]
+```
+
+### How many tools does the LangChain agent see?
+
+This depends on which repository's `list_tools()` you pass to `convert_to_langchain_tools`:
+
+| Source | Tools exposed to the agent | When to use |
+|---|---|---|
+| `meta.list_tools()` | **2** — `get_tool_definition` + `execute_tool` | Agent discovers and calls tools dynamically; works well with large or changing tool sets |
+| `composite.list_tools()` | **All underlying MCP tools** (one per tool, prefixed) | Agent binds directly to each tool; simpler but the full schema list is in every prompt |
+
+**Using `MetaToolRepository` (2 tools)** — the LLM first calls `get_tool_definition` to learn what a tool expects, then calls `execute_tool` to run it. This keeps the agent's tool list small regardless of how many MCP tools exist underneath.
+
+**Using `CompositeToolRepository` (all tools)** — every MCP tool becomes its own LangChain tool. Easier to reason about, but schema bloat grows with the number of tools.
+
+### Usage
+
+```python
+import asyncio
+from mcp_toolbox import (
+    CompositeToolRepository,
+    MCPServerConfig,
+    MCPServerToolRepository,
+    MetaToolRepository,
+)
+from mcp_toolbox.langchain_tools import convert_to_langchain_tools
+
+async def main():
+    repo = MCPServerToolRepository(
+        MCPServerConfig(name="platform", url="http://localhost:5010/mcp", transport="streamable_http")
+    )
+    composite = CompositeToolRepository({"platform": repo})
+    meta = MetaToolRepository(composite)
+    await meta.connect()
+
+    # 2 tools: get_tool_definition + execute_tool
+    lc_tools = convert_to_langchain_tools(await meta.list_tools(), meta.execute_tool)
+
+    # — or — all underlying MCP tools as individual LangChain tools
+    lc_tools_all = convert_to_langchain_tools(await composite.list_tools(), composite.execute_tool)
+
+asyncio.run(main())
+```
+
+`convert_to_langchain_tools` accepts three arguments:
+
+| Argument | Type | Description |
+|---|---|---|
+| `tools` | `list[ToolInfo]` | Tool definitions — typically from `list_tools()` |
+| `executor` | `async callable` | Called as `executor(tool_name, args, meta=None)` — typically `MetaToolRepository.execute_tool` |
+| `meta_provider` | `callable \| None` | Optional `(tool_name, kwargs) -> dict \| None` — return auth/context to forward with each call |
+
+### Forwarding auth context per call
+
+```python
+def my_meta_provider(tool_name: str, kwargs: dict) -> dict | None:
+    return {"auth_cookie": get_current_user_cookie()}
+
+lc_tools = convert_to_langchain_tools(tools, meta.execute_tool, meta_provider=my_meta_provider)
+```
+
+See [`examples/langchain_usage.py`](examples/langchain_usage.py) for a complete runnable example.
+
 ## Development
 
 ```bash

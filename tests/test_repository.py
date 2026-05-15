@@ -14,7 +14,7 @@ from mcp_toolbox import (
     ToolNotFoundError,
 )
 from mcp_toolbox.models import ServerInfo
-from mcp_toolbox.tools import MetaToolRepository
+from mcp_toolbox.meta import MetaToolRepository
 
 
 # ---------------------------------------------------------------------------

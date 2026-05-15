@@ -118,36 +118,27 @@ class MCPServerToolRepository(ToolRepository):
         headers = self._config.headers or {}
         if self._config.transport == "streamable_http":
             async with streamablehttp_client(self._config.url, headers=headers) as (read, write, _):
-                async with ClientSession(read, write) as session:
-                    await self._init_session(session, ready_event)
-                    try:
-                        await asyncio.sleep(float("inf"))
-                    finally:
-                        if self._session is session:
-                            self._session = None
+                await self._run_session(read, write, ready_event)
         elif self._config.transport == "sse":
             async with sse_client(self._config.url, headers=headers) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await self._init_session(session, ready_event)
-                    try:
-                        await asyncio.sleep(float("inf"))
-                    finally:
-                        if self._session is session:
-                            self._session = None
+                await self._run_session(read, write, ready_event)
         elif self._config.transport == "stdio":
             server_params = StdioServerParameters(
                 command=self._config.command, args=self._config.args, env=self._config.env or None
             )
             async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await self._init_session(session, ready_event)
-                    try:
-                        await asyncio.sleep(float("inf"))
-                    finally:
-                        if self._session is session:
-                            self._session = None
+                await self._run_session(read, write, ready_event)
         else:
             raise ValueError(f"Unsupported transport: '{self._config.transport}'")
+
+    async def _run_session(self, read: Any, write: Any, ready_event: asyncio.Event) -> None:
+        async with ClientSession(read, write) as session:
+            await self._init_session(session, ready_event)
+            try:
+                await asyncio.sleep(float("inf"))
+            finally:
+                if self._session is session:
+                    self._session = None
 
     async def _init_session(self, session: ClientSession, ready_event: asyncio.Event) -> None:
         await session.initialize()
