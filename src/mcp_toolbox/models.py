@@ -18,6 +18,7 @@ class MCPServerConfig:
     env: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     tool_call_timeout: float = 60.0
+    max_reconnect_attempts: int = 10
 
     def __post_init__(self) -> None:
         if self.transport in ("streamable_http", "sse") and not self.url:

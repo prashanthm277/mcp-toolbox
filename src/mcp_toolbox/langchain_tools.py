@@ -14,8 +14,14 @@ Usage:
 
 from typing import Any, Callable
 
-from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field, create_model
+try:
+    from langchain_core.tools import BaseTool
+    from pydantic import BaseModel, Field, create_model
+except ImportError as e:
+    raise ImportError(
+        "LangChain integration requires the [langchain] extra. "
+        "Install it with: pip install mcp-toolbox[langchain]"
+    ) from e
 
 from .models import ToolInfo
 
@@ -33,7 +39,7 @@ def _schema_to_pydantic(model_name: str, schema: dict) -> type[BaseModel]:
     return create_model(model_name, **fields)
 
 
-def _make_tool(
+def _wrap_tool_info(
     tool_info: ToolInfo,
     executor: Callable,
     meta_provider: Callable[[str, dict], dict | None] | None,
@@ -71,4 +77,4 @@ def convert_to_langchain_tools(
         meta_provider: Optional callback (tool_name, kwargs) -> dict | None that
             returns auth/meta context to forward on each call.
     """
-    return [_make_tool(t, executor, meta_provider) for t in tools]
+    return [_wrap_tool_info(t, executor, meta_provider) for t in tools]

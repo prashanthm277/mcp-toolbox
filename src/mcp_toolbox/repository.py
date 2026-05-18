@@ -1,13 +1,15 @@
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
 from typing import Any
 
 import anyio
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from .models import MCPServerConfig, ServerInfo, ServerStatus, ToolInfo
 
@@ -97,9 +99,11 @@ class MCPServerToolRepository(ToolRepository):
         self._session = None
 
     async def _run_server_loop(self, ready_event: asyncio.Event) -> None:
+        attempt = 0
         while True:
             try:
                 await self._run_server(ready_event)
+                attempt = 0
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -111,14 +115,30 @@ class MCPServerToolRepository(ToolRepository):
                     ready_event.set()
                     logger.warning("Failed to connect to '%s': %s", self._config.name, exc)
                     return
-                logger.warning("Lost connection to '%s': %s — reconnecting in 5s", self._config.name, exc)
-                await asyncio.sleep(5)
+                attempt += 1
+                if attempt > self._config.max_reconnect_attempts:
+                    self._server_info = ServerInfo(
+                        name=self._config.name, status=ServerStatus.FAILED, tool_count=0,
+                        error=f"Giving up after {self._config.max_reconnect_attempts} reconnect attempts: {exc}",
+                    )
+                    logger.error(
+                        "Giving up on '%s' after %d reconnect attempts",
+                        self._config.name, self._config.max_reconnect_attempts,
+                    )
+                    return
+                delay = min(1 * (2 ** attempt), 30) * (0.5 + random.random() * 0.5)
+                logger.warning(
+                    "Lost connection to '%s': %s — reconnecting in %.1fs (attempt %d/%d)",
+                    self._config.name, exc, delay, attempt, self._config.max_reconnect_attempts,
+                )
+                await asyncio.sleep(delay)
 
     async def _run_server(self, ready_event: asyncio.Event) -> None:
         headers = self._config.headers or {}
         if self._config.transport == "streamable_http":
-            async with streamablehttp_client(self._config.url, headers=headers) as (read, write, _):
-                await self._run_session(read, write, ready_event)
+            async with httpx.AsyncClient(headers=headers) as http_client:
+                async with streamable_http_client(self._config.url, http_client=http_client) as (read, write, _):
+                    await self._run_session(read, write, ready_event)
         elif self._config.transport == "sse":
             async with sse_client(self._config.url, headers=headers) as (read, write):
                 await self._run_session(read, write, ready_event)
@@ -209,7 +229,7 @@ class CompositeToolRepository(ToolRepository):
             for repo in self._repos.values():
                 task_group.start_soon(repo.close)
 
-    async def get_status(self) -> dict[str, ServerInfo]:
+    async def get_status(self) -> dict[str, ServerInfo | None]:
         return {
             server_prefix: repo.server_info
             for server_prefix, repo in self._repos.items()
